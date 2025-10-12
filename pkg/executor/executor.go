@@ -27,6 +27,8 @@ import (
 
 	"github.com/dchest/uniuri"
 	"go.uber.org/zap"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
 	k8sCache "k8s.io/client-go/tools/cache"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
@@ -41,6 +43,7 @@ import (
 	fetcherConfig "github.com/fission/fission/pkg/fetcher/config"
 	"github.com/fission/fission/pkg/generated/clientset/versioned"
 	genInformer "github.com/fission/fission/pkg/generated/informers/externalversions"
+	"github.com/fission/fission/pkg/leaderelection"
 	"github.com/fission/fission/pkg/utils"
 	"github.com/fission/fission/pkg/utils/manager"
 	"github.com/fission/fission/pkg/utils/metrics"
@@ -59,6 +62,18 @@ type (
 
 		requestChan chan *createFuncServiceRequest
 		fsCreateWg  sync.Map
+
+		// Leader election support
+		leaderElector *leaderelection.LeaderElector
+		leaderEnabled bool
+
+		// Informers - only started on the leader instance
+		fissionInformers   map[string]genInformer.SharedInformerFactory
+		poolmgrInformers   map[string]informers.SharedInformerFactory
+		newdeployInformers map[string]informers.SharedInformerFactory
+		containerInformers map[string]informers.SharedInformerFactory
+		configMapInformers map[string]k8sCache.SharedIndexInformer
+		secretInformers    map[string]k8sCache.SharedIndexInformer
 	}
 	createFuncServiceRequest struct {
 		context  context.Context
@@ -73,9 +88,14 @@ type (
 )
 
 // MakeExecutor returns an Executor for given ExecutorType(s).
+// Note: This function creates executor types but does NOT start their reconciliation loops.
+// When leader election is enabled, the loops are started only on the leader instance.
+// When leader election is disabled, they are started immediately after this function returns.
+// The serveCreateFuncServices handler is also not started here - it will be started either
+// in the OnStartedLeading callback (when leader election is enabled) or in setupLeaderElection
+// (when leader election is disabled).
 func MakeExecutor(ctx context.Context, logger *zap.Logger, mgr manager.Interface, cms *cms.ConfigSecretController,
-	fissionClient versioned.Interface, types map[fv1.ExecutorType]executortype.ExecutorType,
-	informers ...k8sCache.SharedIndexInformer) (*Executor, error) {
+	fissionClient versioned.Interface, types map[fv1.ExecutorType]executortype.ExecutorType) (*Executor, error) {
 	executor := &Executor{
 		logger:        logger.Named("executor"),
 		cms:           cms,
@@ -85,24 +105,81 @@ func MakeExecutor(ctx context.Context, logger *zap.Logger, mgr manager.Interface
 		requestChan: make(chan *createFuncServiceRequest),
 	}
 
-	// Run all informers
-	for _, informer := range informers {
-		informer := informer
-		mgr.Add(ctx, func(ctx context.Context) {
-			informer.Run(ctx.Done())
-		})
-	}
+	return executor, nil
+}
 
-	for _, et := range types {
+// startExecutorTypes starts all executor type reconciliation loops.
+// This should only be called on the leader instance when leader election is enabled.
+func (executor *Executor) startExecutorTypes(ctx context.Context, mgr manager.Interface) {
+	executor.logger.Info("starting executor type reconciliation loops")
+	for _, et := range executor.executorTypes {
 		et := et
 		mgr.Add(ctx, func(ctx context.Context) {
 			et.Run(ctx, mgr)
 		})
 	}
-	mgr.Add(ctx, func(ctx context.Context) {
-		executor.serveCreateFuncServices(ctx)
-	})
-	return executor, nil
+}
+
+// startAllInformers starts all informers (Fission, executor-specific, ConfigMap, and Secret).
+// This should only be called on the leader instance when leader election is enabled.
+func (executor *Executor) startAllInformers(ctx context.Context) {
+	executor.logger.Info("starting all informers on leader instance")
+
+	// Start Fission resource informers (Functions, Packages, Environments, etc.)
+	for _, factory := range executor.fissionInformers {
+		factory.Start(ctx.Done())
+	}
+
+	// Start poolmgr executor informers
+	for _, factory := range executor.poolmgrInformers {
+		factory.Start(ctx.Done())
+	}
+
+	// Start newdeploy executor informers
+	for _, factory := range executor.newdeployInformers {
+		factory.Start(ctx.Done())
+	}
+
+	// Start container executor informers
+	for _, factory := range executor.containerInformers {
+		factory.Start(ctx.Done())
+	}
+
+	// Start ConfigMap informers
+	for _, informer := range executor.configMapInformers {
+		go informer.Run(ctx.Done())
+	}
+
+	// Start Secret informers
+	for _, informer := range executor.secretInformers {
+		go informer.Run(ctx.Done())
+	}
+
+	executor.logger.Info("all informers started successfully")
+}
+
+// adoptAndCleanupResources adopts existing resources and cleans up old executor objects.
+// This should only be called on the leader instance when it starts leading.
+func (executor *Executor) adoptAndCleanupResources(ctx context.Context) {
+	executor.logger.Info("adopting existing resources and cleaning up old executor objects")
+
+	wg := &sync.WaitGroup{}
+	for _, et := range executor.executorTypes {
+		wg.Add(1)
+		go func(et executortype.ExecutorType) {
+			defer wg.Done()
+
+			adoptExistingResources, _ := strconv.ParseBool(os.Getenv("ADOPT_EXISTING_RESOURCES"))
+			if adoptExistingResources {
+				et.AdoptExistingResources(ctx)
+			}
+			et.CleanupOldExecutorObjects(ctx)
+		}(et)
+	}
+
+	// Wait for all adoption and cleanup tasks to complete with a timeout
+	util.WaitTimeout(wg, 30*time.Second)
+	executor.logger.Info("resource adoption and cleanup complete")
 }
 
 // All non-cached function service requests go through this goroutine
@@ -225,6 +302,16 @@ func (executor *Executor) serveCreateFuncServices(ctx context.Context) {
 func (executor *Executor) createServiceForFunction(ctx context.Context, fn *fv1.Function) (*fscache.FuncSvc, error) {
 	logger := otelUtils.LoggerWithTraceID(ctx, executor.logger)
 	otelUtils.SpanTrackEvent(ctx, "createServiceForFunction", otelUtils.GetAttributesForFunction(fn)...)
+
+	// Check if this instance is the leader before creating new resources
+	if err := executor.RequireLeader(); err != nil {
+		logger.Warn("rejecting function service creation request - not leader",
+			zap.String("function_name", fn.ObjectMeta.Name),
+			zap.String("function_namespace", fn.ObjectMeta.Namespace),
+			zap.Error(err))
+		return nil, err
+	}
+
 	logger.Debug("no cached function service found, creating one",
 		zap.String("function_name", fn.ObjectMeta.Name),
 		zap.String("function_namespace", fn.ObjectMeta.Namespace))
@@ -256,6 +343,102 @@ func (executor *Executor) getFunctionServiceFromCache(ctx context.Context, fn *f
 		return nil, fmt.Errorf("unknown executor type '%s'", t)
 	}
 	return e.GetFuncSvcFromCache(ctx, fn)
+}
+
+// IsLeader returns true if this executor instance is the leader.
+// If leader election is disabled, always returns true.
+func (executor *Executor) IsLeader() bool {
+	if !executor.leaderEnabled {
+		return true
+	}
+	if executor.leaderElector == nil {
+		return false
+	}
+	return executor.leaderElector.IsLeader()
+}
+
+// RequireLeader returns an error if this executor is not the leader and leader election is enabled.
+func (executor *Executor) RequireLeader() error {
+	if !executor.IsLeader() {
+		leaderIdentity := ""
+		if executor.leaderElector != nil {
+			leaderIdentity = executor.leaderElector.GetLeader()
+		}
+		return fmt.Errorf("this executor instance is not the leader (current leader: %s)", leaderIdentity)
+	}
+	return nil
+}
+
+// setupLeaderElection initializes and starts leader election for the executor if enabled.
+// It reads configuration from environment variables and starts the leader election goroutine.
+// When leader election is disabled, it starts all executor types and informers immediately.
+func setupLeaderElection(ctx context.Context, executor *Executor, kubernetesClient kubernetes.Interface, logger *zap.Logger, mgr manager.Interface) error {
+	leaderEnabled, _ := strconv.ParseBool(os.Getenv("ENABLE_LEADER_ELECTION"))
+	if !leaderEnabled {
+		logger.Info("leader election disabled for executor - starting all reconciliation loops and informers immediately")
+		executor.leaderEnabled = false
+
+		// When leader election is disabled, adopt resources and start everything immediately
+		executor.adoptAndCleanupResources(ctx)
+
+		// Start all informers (only on this instance since leader election is disabled)
+		executor.startAllInformers(ctx)
+
+		// Start the function service creation request handler
+		mgr.Add(ctx, func(ctx context.Context) {
+			executor.serveCreateFuncServices(ctx)
+		})
+
+		executor.startExecutorTypes(ctx, mgr)
+
+		return nil
+	}
+
+	logger.Info("leader election enabled for executor")
+
+	// Get configuration from environment variables
+	leaseName := os.Getenv("EXECUTOR_LEASE_NAME")
+	if leaseName == "" {
+		leaseName = "fission-executor"
+	}
+
+	leaseNamespace := os.Getenv("EXECUTOR_LEASE_NAMESPACE")
+	if leaseNamespace == "" {
+		leaseNamespace = utils.DefaultNSResolver().FunctionNamespace
+	}
+
+	// Create a cancellable context for graceful shutdown
+	// This allows the OnStoppedLeading callback to trigger shutdown of all components
+	ctx, cancel := context.WithCancel(ctx)
+
+	// Create leader election config with callbacks that control executor types
+	leConfig := &leaderelection.LeaderElectionConfig{
+		Logger:             logger,
+		Component:          "executor",
+		KubeClient:         kubernetesClient,
+		CallbacksProvider:  NewExecutorCallbacksProvider(logger, executor, mgr, cancel),
+		LeaseLockName:      leaseName,
+		LeaseLockNamespace: leaseNamespace,
+		// Using default durations from leaderelection package
+	}
+
+	elector, err := leaderelection.NewLeaderElector(leConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create leader elector: %w", err)
+	}
+
+	executor.leaderElector = elector
+	executor.leaderEnabled = true
+
+	// Start leader election in background
+	mgr.Add(ctx, func(ctx context.Context) {
+		logger.Info("starting leader election for executor")
+		if err := elector.Run(ctx); err != nil {
+			logger.Error("leader election stopped with error", zap.Error(err))
+		}
+	})
+
+	return nil
 }
 
 // StartExecutor Starts executor and the executor components such as Poolmgr,
@@ -348,55 +531,38 @@ func StartExecutor(ctx context.Context, clientGen crd.ClientGeneratorInterface, 
 	executorTypes[ndm.GetTypeName(ctx)] = ndm
 	executorTypes[cnm.GetTypeName(ctx)] = cnm
 
-	adoptExistingResources, _ := strconv.ParseBool(os.Getenv("ADOPT_EXISTING_RESOURCES"))
+	// Note: AdoptExistingResources and CleanupOldExecutorObjects are now called in adoptAndCleanupResources
+	// which is invoked either in setupLeaderElection (when leader election is disabled) or in the
+	// OnStartedLeading callback (when leader election is enabled and this instance becomes leader)
 
-	wg := &sync.WaitGroup{}
-	for _, et := range executorTypes {
-		wg.Add(1)
-		go func(et executortype.ExecutorType) {
-			defer wg.Done()
-			if adoptExistingResources {
-				et.AdoptExistingResources(ctx)
-			}
-			et.CleanupOldExecutorObjects(ctx)
-		}(et)
-	}
-	// set hard timeout for resource adoption
-	// TODO: use context to control the waiting time once kubernetes client supports it.
-	util.WaitTimeout(wg, 30*time.Second)
-
+	// Create ConfigMap and Secret informers but don't start them yet
 	configMapInformer := utils.GetK8sInformersForNamespaces(kubernetesClient, time.Minute*30, fv1.ConfigMaps)
 	secretInformer := utils.GetK8sInformersForNamespaces(kubernetesClient, time.Minute*30, fv1.Secrets)
+
 	cms, err := cms.MakeConfigSecretController(ctx, logger, fissionClient, kubernetesClient, executorTypes, configMapInformer, secretInformer)
 	if err != nil {
 		return fmt.Errorf("error creating configmap and secret controller: %w", err)
 	}
 
-	fissionInformers := make([]k8sCache.SharedIndexInformer, 0)
-	for _, informer := range configMapInformer {
-		fissionInformers = append(fissionInformers, informer)
-	}
-	for _, informer := range secretInformer {
-		fissionInformers = append(fissionInformers, informer)
-	}
-	for _, factory := range finformerFactory {
-		factory.Start(ctx.Done())
-	}
-	for _, informerFactory := range gpmInformerFactory {
-		informerFactory.Start(ctx.Done())
-	}
-	for _, informerFactory := range ndmInformerFactory {
-		informerFactory.Start(ctx.Done())
-	}
-	for _, informerFactory := range cnmInformerFactory {
-		informerFactory.Start(ctx.Done())
-	}
-
-	api, err := MakeExecutor(ctx, logger, mgr, cms, fissionClient, executorTypes,
-		fissionInformers...,
-	)
+	api, err := MakeExecutor(ctx, logger, mgr, cms, fissionClient, executorTypes)
 	if err != nil {
 		return err
+	}
+
+	// Store all informer factories in the executor
+	// They will be started ONLY when this instance becomes leader (or immediately if leader election is disabled)
+	// This prevents multiple informers from watching the same resources and causing race conditions
+	api.fissionInformers = finformerFactory
+	api.poolmgrInformers = gpmInformerFactory
+	api.newdeployInformers = ndmInformerFactory
+	api.containerInformers = cnmInformerFactory
+	api.configMapInformers = configMapInformer
+	api.secretInformers = secretInformer
+
+	// Initialize leader election if enabled
+	// This will start executor types and config/secret informers on the leader
+	if err := setupLeaderElection(ctx, api, kubernetesClient, logger, mgr); err != nil {
+		return fmt.Errorf("failed to setup leader election: %w", err)
 	}
 
 	utils.CreateMissingPermissionForSA(ctx, kubernetesClient, logger)

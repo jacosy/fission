@@ -233,6 +233,15 @@ func (executor *Executor) healthHandler(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusOK)
 }
 
+func (executor *Executor) readyHandler(w http.ResponseWriter, r *http.Request) {
+	// Check if leader election is enabled and if so, whether we're the leader
+	if executor.leaderEnabled && !executor.IsLeader() {
+		http.Error(w, "Not ready: not the leader", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
 func (executor *Executor) unTapService(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	body, err := io.ReadAll(r.Body)
@@ -281,6 +290,7 @@ func (executor *Executor) GetHandler() http.Handler {
 	r.HandleFunc("/v2/tapService", executor.tapService).Methods("POST") // for backward compatibility
 	r.HandleFunc("/v2/tapServices", executor.tapServices).Methods("POST")
 	r.HandleFunc("/healthz", executor.healthHandler).Methods("GET")
+	r.HandleFunc("/readyz", executor.readyHandler).Methods("GET")
 	r.HandleFunc("/v2/unTapService", executor.unTapService).Methods("POST")
 	r.HandleFunc("/v2/debugInfo", executor.dumpDebugInfo).Methods("GET")
 	return r
@@ -288,6 +298,6 @@ func (executor *Executor) GetHandler() http.Handler {
 
 // Serve starts an HTTP server.
 func (executor *Executor) Serve(ctx context.Context, mgr manager.Interface, port int) {
-	handler := otelUtils.GetHandlerWithOTEL(executor.GetHandler(), "fission-executor", otelUtils.UrlsToIgnore("/healthz"))
+	handler := otelUtils.GetHandlerWithOTEL(executor.GetHandler(), "fission-executor", otelUtils.UrlsToIgnore("/healthz", "/readyz"))
 	httpserver.StartServer(ctx, executor.logger, mgr, "executor", fmt.Sprintf("%d", port), handler)
 }
