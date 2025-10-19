@@ -57,9 +57,7 @@ import (
 	otelUtils "github.com/fission/fission/pkg/utils/otel"
 )
 
-var (
-	_ executortype.ExecutorType = &GenericPoolManager{}
-)
+var _ executortype.ExecutorType = &GenericPoolManager{}
 
 type requestType int
 
@@ -123,7 +121,6 @@ func MakeGenericPoolManager(ctx context.Context,
 	gpmInformerFactory map[string]k8sInformers.SharedInformerFactory,
 	podSpecPatch *apiv1.PodSpec,
 ) (executortype.ExecutorType, error) {
-
 	gpmLogger := logger.Named("generic_pool_manager")
 
 	enableIstio := false
@@ -308,7 +305,6 @@ func (gpm *GenericPoolManager) IsValid(ctx context.Context, fsvc *fscache.FuncSv
 }
 
 func (gpm *GenericPoolManager) RefreshFuncPods(ctx context.Context, logger *zap.Logger, f fv1.Function) error {
-
 	env, err := gpm.fissionClient.CoreV1().Environments(f.Spec.Environment.Namespace).Get(ctx, f.Spec.Environment.Name, metav1.GetOptions{})
 	if err != nil {
 		return err
@@ -335,7 +331,6 @@ func (gpm *GenericPoolManager) RefreshFuncPods(ctx context.Context, logger *zap.
 	podList, err := gpm.kubernetesClient.CoreV1().Pods(f.Spec.Environment.Namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: labels.Set(funcLabels).AsSelector().String(),
 	})
-
 	if err != nil {
 		return err
 	}
@@ -371,7 +366,7 @@ func (gpm *GenericPoolManager) AdoptExistingResources(ctx context.Context) {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					_, created, err := gpm.getPool(ctx, &env)
+					_, created, err := gpm.getPoolService(ctx, &env)
 					if err != nil {
 						gpm.logger.Error("adopt pool failed", zap.Error(err))
 					}
@@ -395,7 +390,6 @@ func (gpm *GenericPoolManager) AdoptExistingResources(ctx context.Context) {
 		podList, err := gpm.kubernetesClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
 			LabelSelector: labels.Set(l).AsSelector().String(),
 		})
-
 		if err != nil {
 			gpm.logger.Error("error getting pod list", zap.Error(err))
 			return
@@ -519,25 +513,8 @@ func (gpm *GenericPoolManager) service() {
 		switch req.requestType {
 		case GET_POOL:
 			// just because they are missing in the cache, we end up creating another duplicate pool.
-			var err error
-			created := false
-			pool, ok := gpm.pools[crd.CacheKeyUIDFromMeta(&req.env.ObjectMeta)]
-			if !ok {
-				// To support backward compatibility, if envs are created in default ns, we go ahead
-				// and create pools in fission-function ns as earlier.
-				ns := gpm.nsResolver.GetFunctionNS(req.env.ObjectMeta.Namespace)
-				pool = MakeGenericPool(gpm.logger, gpm.fissionClient, gpm.kubernetesClient,
-					gpm.metricsClient, req.env, ns, gpm.fsCache,
-					gpm.fetcherConfig, gpm.instanceID, gpm.enableIstio, gpm.podSpecPatch)
-				err = pool.setup(req.ctx)
-				if err != nil {
-					req.responseChannel <- &response{error: err}
-					continue
-				}
-				gpm.pools[crd.CacheKeyUIDFromMeta(&req.env.ObjectMeta)] = pool
-				created = true
-			}
-			req.responseChannel <- &response{pool: pool, created: created}
+			pool, created, err := gpm.getPoolService(req.ctx, req.env)
+			req.responseChannel <- &response{pool: pool, created: created, error: err}
 		case CLEANUP_POOL:
 			env := *req.env
 			gpm.logger.Info("destroying pool",
@@ -563,6 +540,30 @@ func (gpm *GenericPoolManager) service() {
 			// no response, caller doesn't wait
 		}
 	}
+}
+
+func (gpm *GenericPoolManager) getPoolService(ctx context.Context, env *fv1.Environment) (*GenericPool, bool, error) {
+	// just because they are missing in the cache, we end up creating another duplicate pool.
+	var err error
+	created := false
+	pool, ok := gpm.pools[crd.CacheKeyUIDFromMeta(&env.ObjectMeta)]
+	if !ok {
+		// To support backward compatibility, if envs are created in default ns, we go ahead
+		// and create pools in fission-function ns as earlier.
+		ns := gpm.nsResolver.GetFunctionNS(env.ObjectMeta.Namespace)
+		pool = MakeGenericPool(gpm.logger, gpm.fissionClient, gpm.kubernetesClient,
+			gpm.metricsClient, env, ns, gpm.fsCache,
+			gpm.fetcherConfig, gpm.instanceID, gpm.enableIstio, gpm.podSpecPatch)
+		err = pool.setup(ctx)
+		if err != nil {
+			return nil, false, err
+		}
+
+		gpm.pools[crd.CacheKeyUIDFromMeta(&env.ObjectMeta)] = pool
+		created = true
+	}
+
+	return pool, created, nil
 }
 
 func (gpm *GenericPoolManager) getPool(ctx context.Context, env *fv1.Environment) (*GenericPool, bool, error) {
@@ -774,7 +775,6 @@ func (gpm *GenericPoolManager) NoActiveConnectionEventChecker(ctx context.Contex
 						time.Sleep(50 * time.Millisecond)
 					}
 				}
-
 			},
 		})
 		if err != nil {
